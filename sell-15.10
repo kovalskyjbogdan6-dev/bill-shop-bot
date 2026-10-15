@@ -1,28 +1,38 @@
-import asyncio
 import os
-import random
 import sqlite3
+import random
+import asyncio
 
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command, CommandStart
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
-from dotenv import load_dotenv
+from aiogram.utils.deep_linking import create_start_link
 
-load_dotenv()
 
-# Настройки бота
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 1040670594
+# =========================
+# НАСТРОЙКИ
+# =========================
 
+TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+if not TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
+
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# База данных пользователей
-DB_NAME = "bot_database.db"
+DB_NAME = "bill_shop.db"
 
+
+# =========================
+# БАЗА ДАННЫХ
+# =========================
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
@@ -30,200 +40,438 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                full_name TEXT,
+                first_name TEXT,
+                inviter_id INTEGER,
                 coins INTEGER DEFAULT 0
             )
         """)
 
-
-def save_user(user_id: int, username: str | None, full_name: str):
-    with sqlite3.connect(DB_NAME) as conn:
         conn.execute("""
-            INSERT INTO users (user_id, username, full_name)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                full_name = excluded.full_name
-        """, (user_id, username, full_name))
+            CREATE TABLE IF NOT EXISTS referrals (
+                invited_id INTEGER PRIMARY KEY,
+                inviter_id INTEGER NOT NULL
+            )
+        """)
+
+        conn.commit()
 
 
-def get_user(user_id: int):
+def register_user(user, inviter_id=None):
     with sqlite3.connect(DB_NAME) as conn:
-        return conn.execute(
-            "SELECT user_id, username, full_name, coins "
-            "FROM users WHERE user_id = ?",
+        existing = conn.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user.id,)
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                (user.username, user.first_name, user.id)
+            )
+            conn.commit()
+            return
+
+        # Нельзя пригласить самого себя.
+        if inviter_id == user.id:
+            inviter_id = None
+
+        # Принимаем пригласившего только если он уже есть в базе.
+        if inviter_id:
+            inviter_exists = conn.execute(
+                "SELECT user_id FROM users WHERE user_id = ?",
+                (inviter_id,)
+            ).fetchone()
+
+            if not inviter_exists:
+                inviter_id = None
+
+        conn.execute(
+            """
+            INSERT INTO users
+            (user_id, username, first_name, inviter_id, coins)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (user.id, user.username, user.first_name, inviter_id)
+        )
+
+        if inviter_id:
+            conn.execute(
+                "INSERT OR IGNORE INTO referrals (invited_id, inviter_id) VALUES (?, ?)",
+                (user.id, inviter_id)
+            )
+
+        conn.commit()
+
+
+def get_coins(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute(
+            "SELECT coins FROM users WHERE user_id = ?",
             (user_id,)
         ).fetchone()
 
+    return row[0] if row else 0
 
-def add_coins(user_id: int, amount: int):
+
+def add_coins(user_id, amount):
     with sqlite3.connect(DB_NAME) as conn:
         conn.execute(
             "UPDATE users SET coins = coins + ? WHERE user_id = ?",
             (amount, user_id)
         )
+        conn.commit()
 
 
-# Главное меню
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [
-            KeyboardButton(text="🎁 Подарки"),
-            KeyboardButton(text="⭐ Telegram Stars"),
-        ],
-        [
-            KeyboardButton(text="💎 Telegram Premium"),
-            KeyboardButton(text="🎮 Мини-игра"),
-        ],
-        [
-            KeyboardButton(text="👤 Мой профиль"),
-            KeyboardButton(text="🆘 Поддержка"),
-        ],
-    ],
-    resize_keyboard=True,
-)
+def get_referrals(user_id):
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM referrals WHERE inviter_id = ?",
+            (user_id,)
+        ).fetchone()
 
+    return row[0] if row else 0
+
+
+def get_total_users():
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()
+
+    return row[0] if row else 0
+
+
+# =========================
+# КЛАВИАТУРЫ
+# =========================
+
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎁 Бесплатные мишки",
+                callback_data="free_bears"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🧸 Подарки",
+                callback_data="gifts"
+            ),
+            InlineKeyboardButton(
+                text="⭐ Telegram Stars",
+                callback_data="stars"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="💎 Telegram Premium",
+                callback_data="premium"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🎮 Мини-игры",
+                callback_data="games"
+            ),
+            InlineKeyboardButton(
+                text="👤 Профиль",
+                callback_data="profile"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📊 Статистика",
+                callback_data="stats"
+            )
+        ]
+    ])
+
+
+def back_keyboard(destination="home"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=destination
+            )
+        ]
+    ])
+
+
+def games_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎯 Испытать удачу",
+                callback_data="play_game"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data="home"
+            )
+        ]
+    ])
+
+
+# =========================
+# ОТОБРАЖЕНИЕ СТРАНИЦ
+# =========================
+
+async def show_page(target, page, user_id=None):
+    if user_id is None:
+        user_id = target.from_user.id
+
+    if page == "home":
+        text = (
+            "🛍 <b>BILL SHOP</b>\n\n"
+            "Добро пожаловать!\n"
+            "Выбери нужный раздел ниже."
+        )
+        keyboard = main_keyboard()
+
+    elif page == "free_bears":
+        link = await create_start_link(
+            bot,
+            f"ref_{user_id}",
+            encode=False
+        )
+
+        referrals = get_referrals(user_id)
+
+        text = (
+            "🎁 <b>Бесплатные мишки</b>\n\n"
+            "Приглашай друзей по своей персональной ссылке!\n\n"
+            f"👥 Приглашено друзей: <b>{referrals}</b>\n\n"
+            "🔗 <b>Твоя ссылка:</b>\n"
+            f"<code>{link}</code>\n\n"
+            "Когда новый пользователь впервые запустит бота "
+            "по этой ссылке, он будет записан как твой приглашённый.\n\n"
+            "ℹ️ Получение реальных подарков пока не подключено."
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить статистику",
+                    callback_data="free_bears"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="home"
+                )
+            ]
+        ])
+
+    elif page == "gifts":
+        text = (
+            "🧸 <b>Подарки</b>\n\n"
+            "Здесь будет каталог Telegram-подарков.\n"
+            "Покупка и выдача подарков пока не подключены."
+        )
+        keyboard = back_keyboard()
+
+    elif page == "stars":
+        text = (
+            "⭐ <b>Telegram Stars</b>\n\n"
+            "Раздел Telegram Stars.\n"
+            "Оплата и выдача звёзд пока не подключены."
+        )
+        keyboard = back_keyboard()
+
+    elif page == "premium":
+        text = (
+            "💎 <b>Telegram Premium</b>\n\n"
+            "Раздел Telegram Premium.\n"
+            "Покупка подписки пока не подключена."
+        )
+        keyboard = back_keyboard()
+
+    elif page == "games":
+        text = (
+            "🎮 <b>Мини-игры</b>\n\n"
+            "Играй и получай учебные монеты.\n"
+            "Монеты не имеют денежной стоимости и не выводятся."
+        )
+        keyboard = games_keyboard()
+
+    elif page == "profile":
+        coins = get_coins(user_id)
+        referrals = get_referrals(user_id)
+
+        text = (
+            "👤 <b>Твой профиль</b>\n\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"🪙 Учебные монеты: <b>{coins}</b>\n"
+            f"👥 Приглашено друзей: <b>{referrals}</b>"
+        )
+        keyboard = back_keyboard()
+
+    elif page == "stats":
+        text = (
+            "📊 <b>Статистика BILL SHOP</b>\n\n"
+            f"👥 Пользователей: <b>{get_total_users()}</b>"
+        )
+        keyboard = back_keyboard()
+
+    else:
+        text = "Неизвестный раздел."
+        keyboard = back_keyboard()
+
+    if isinstance(target, Message):
+        await target.answer(
+            text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    else:
+        try:
+            await target.message.edit_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception:
+            await target.message.answer(
+                text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+
+
+# =========================
+# КОМАНДА /START
+# =========================
 
 @dp.message(CommandStart())
-async def start(message: Message):
-    user = message.from_user
-    save_user(user.id, user.username, user.full_name)
+async def start_handler(message: Message):
+    inviter_id = None
 
-    await message.answer(
-        f"👋 Привет, {user.first_name}!\n\n"
-        "Добро пожаловать в BILL SHOP.\n\n"
-        "Выбери нужный раздел в меню.\n"
-        "Каталог пока демонстрационный: реальные покупки "
-        "и платежи не подключены.",
-        reply_markup=main_keyboard,
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) > 1:
+        payload = parts[1].strip()
+
+        if payload.startswith("ref_"):
+            try:
+                inviter_id = int(payload[4:])
+            except ValueError:
+                inviter_id = None
+
+    register_user(message.from_user, inviter_id)
+
+    await show_page(
+        message,
+        "home",
+        message.from_user.id
     )
 
 
-@dp.message(Command("id"))
-async def show_id(message: Message):
-    await message.answer(
-        f"Твой Telegram ID: {message.from_user.id}"
+# =========================
+# ОБРАБОТКА КНОПОК
+# =========================
+
+@dp.callback_query(F.data.in_({
+    "home",
+    "free_bears",
+    "gifts",
+    "stars",
+    "premium",
+    "games",
+    "profile",
+    "stats"
+}))
+async def page_handler(callback: CallbackQuery):
+    await callback.answer()
+
+    await show_page(
+        callback,
+        callback.data,
+        callback.from_user.id
     )
 
 
-@dp.message(Command("admin"))
-async def admin(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Эта команда доступна только администратору.")
-        return
+# =========================
+# МИНИ-ИГРА
+# =========================
 
-    with sqlite3.connect(DB_NAME) as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
+@dp.callback_query(F.data == "play_game")
+async def play_game_handler(callback: CallbackQuery):
+    await callback.answer()
 
-    await message.answer(
-        "🛠 Панель администратора\n\n"
-        f"ID администратора: {ADMIN_ID}\n"
-        f"Пользователей в базе: {count}"
-    )
+    user_id = callback.from_user.id
 
-
-@dp.message(lambda m: m.text == "🎁 Подарки")
-async def gifts(message: Message):
-    await message.answer(
-        "🎁 Каталог подарков\n\n"
-        "Здесь будет список доступных подарков Telegram.\n"
-        "Каталог и цены пока не подключены к актуальным данным.\n"
-        "Заказы и оплата сейчас недоступны."
-    )
-
-
-@dp.message(lambda m: m.text == "⭐ Telegram Stars")
-async def stars(message: Message):
-    await message.answer(
-        "⭐ Telegram Stars\n\n"
-        "Раздел находится в разработке.\n"
-        "Реальные цены и оплата пока не подключены."
-    )
-
-
-@dp.message(lambda m: m.text == "💎 Telegram Premium")
-async def premium(message: Message):
-    await message.answer(
-        "💎 Telegram Premium\n\n"
-        "Раздел находится в разработке.\n"
-        "Реальные покупки пока не подключены."
-    )
-
-
-@dp.message(lambda m: m.text == "🎮 Мини-игра")
-async def game(message: Message):
-    user_id = message.from_user.id
+    # Только бесплатные учебные монеты.
     reward = random.randint(1, 5)
     add_coins(user_id, reward)
 
-    user = get_user(user_id)
-    balance = user[3] if user else reward
+    coins = get_coins(user_id)
 
-    await message.answer(
-        "🎮 Ты сыграл в мини-игру!\n\n"
-        f"Начислено учебных монет: {reward}\n"
-        f"Баланс учебных монет: {balance}\n\n"
-        "Монеты не имеют денежной стоимости, "
-        "их нельзя купить, вывести или обменять."
+    text = (
+        "🎮 <b>Результат игры</b>\n\n"
+        f"🪙 Получено учебных монет: <b>+{reward}</b>\n"
+        f"💰 Всего монет: <b>{coins}</b>\n\n"
+        "Монеты не являются деньгами и не выводятся."
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎯 Играть ещё",
+                callback_data="play_game"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ В меню игр",
+                callback_data="games"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏠 Главное меню",
+                callback_data="home"
+            )
+        ]
+    ])
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
 
 
-@dp.message(lambda m: m.text == "👤 Мой профиль")
-async def profile(message: Message):
-    user = get_user(message.from_user.id)
+# =========================
+# АДМИНИСТРАТОР
+# =========================
 
-    if not user:
-        save_user(
-            message.from_user.id,
-            message.from_user.username,
-            message.from_user.full_name,
-        )
-        user = get_user(message.from_user.id)
+@dp.message(F.text == "/admin")
+async def admin_handler(message: Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У тебя нет доступа к этой команде.")
+        return
 
     await message.answer(
-        "👤 Твой профиль\n\n"
-        f"Имя: {user[2]}\n"
-        f"ID: {user[0]}\n"
-        f"Username: @{user[1] if user[1] else 'не указан'}\n"
-        f"Учебные монеты: {user[3]}"
+        "🛠 <b>Панель администратора</b>\n\n"
+        f"👥 Пользователей: {get_total_users()}\n"
+        f"🆔 Твой ID: <code>{message.from_user.id}</code>",
+        parse_mode="HTML"
     )
 
 
-@dp.message(lambda m: m.text == "🆘 Поддержка")
-async def support(message: Message):
-    await message.answer(
-        "🆘 Поддержка\n\n"
-        "По вопросам работы бота обратись к администратору."
-    )
-
-
-@dp.message()
-async def unknown(message: Message):
-    await message.answer(
-        "Не понял команду. Выбери раздел в меню ниже.",
-        reply_markup=main_keyboard,
-    )
-
+# =========================
+# ЗАПУСК
+# =========================
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не задан BOT_TOKEN. Добавь новый токен "
-            "в переменные окружения хостинга."
-        )
-
     init_db()
-
-    bot = Bot(token=BOT_TOKEN)
-
-    print("BILL SHOP запущен.")
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    print("BILL SHOP запущен")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
