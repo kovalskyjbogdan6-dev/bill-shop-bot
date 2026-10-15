@@ -1,0 +1,404 @@
+
+import os
+import asyncio
+import sqlite3
+import random
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL = os.getenv("CHANNEL_USERNAME", "").lstrip("@")
+GROUP = os.getenv("GROUP_USERNAME", "").lstrip("@")
+SHOP_NAME = os.getenv("SHOP_NAME", "Магазин звёзд Билла")
+DB_NAME = "shop.db"
+
+if not TOKEN:
+    raise RuntimeError("Укажи BOT_TOKEN в переменных окружения.")
+
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+
+
+def init_db():
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                balance INTEGER DEFAULT 0
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                item TEXT,
+                status TEXT DEFAULT 'Новая заявка',
+                created_at TEXT
+            )
+        """)
+
+
+def register_user(user):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute(
+            """INSERT OR IGNORE INTO users
+               (user_id, username, balance) VALUES (?, ?, 0)""",
+            (user.id, user.username or "")
+        )
+        db.execute(
+            "UPDATE users SET username=? WHERE user_id=?",
+            (user.username or "", user.id)
+        )
+
+
+def keyboard(rows):
+    kb = InlineKeyboardBuilder()
+    for text, data in rows:
+        if data.startswith("url:"):
+            kb.button(text=text, url=data[4:])
+        else:
+            kb.button(text=text, callback_data=data)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def main_menu():
+    rows = [
+        ("🧸 Бесплатные мишки", "free"),
+        ("⭐ Купить Stars", "stars"),
+        ("🌟 Telegram Premium", "premium"),
+        ("🎁 Подарки", "gifts"),
+        ("🎟 Розыгрыши", "giveaways"),
+        ("🎮 Мини-игры", "games"),
+        ("👤 Мой профиль", "profile"),
+    ]
+
+    if GROUP:
+        rows.append(("💬 Группа Билла", f"url:https://t.me/{GROUP}"))
+
+    return keyboard(rows)
+
+
+def back_menu():
+    return keyboard([("⬅️ Главное меню", "home")])
+
+
+async def check_subscription(user_id):
+    chats = []
+
+    if CHANNEL:
+        chats.append("@" + CHANNEL)
+    if GROUP:
+        chats.append("@" + GROUP)
+
+    for chat in chats:
+        try:
+            member = await bot.get_chat_member(chat, user_id)
+            if member.status not in ("member", "administrator", "creator"):
+                return False
+        except Exception:
+            return False
+
+    return True
+
+
+def subscription_menu():
+    rows = []
+
+    if CHANNEL:
+        rows.append((
+            "📢 Подписаться на канал",
+            f"url:https://t.me/{CHANNEL}"
+        ))
+
+    if GROUP:
+        rows.append((
+            "💬 Вступить в группу",
+            f"url:https://t.me/{GROUP}"
+        ))
+
+    rows.append(("✅ Я подписался", "check_sub"))
+    return keyboard(rows)
+
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    register_user(message.from_user)
+
+    if not await check_subscription(message.from_user.id):
+        await message.answer(
+            "👋 Привет!\n\n"
+            "Чтобы пользоваться ботом, подпишись на канал "
+            "и вступи в группу. Затем нажми «Я подписался».",
+            reply_markup=subscription_menu()
+        )
+        return
+
+    await message.answer(
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        f"Добро пожаловать в <b>{SHOP_NAME}</b>!\n\n"
+        "Здесь ты можешь посмотреть товары, оформить заявку "
+        "и получить бесплатные виртуальные монеты.",
+        reply_markup=main_menu()
+    )
+
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub(callback: CallbackQuery):
+    if await check_subscription(callback.from_user.id):
+        await callback.message.edit_text(
+            "✅ Подписка подтверждена!\n\n"
+            "Нажми /start, чтобы открыть магазин."
+        )
+        await callback.answer("Успешно!")
+    else:
+        await callback.answer(
+            "Сначала подпишись на канал и вступи в группу.",
+            show_alert=True
+        )
+
+
+@dp.callback_query(F.data == "home")
+async def home(callback: CallbackQuery):
+    await callback.message.edit_text(
+        f"⭐ <b>{SHOP_NAME}</b>\n\nВыбери нужный раздел:",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stars")
+async def stars(callback: CallbackQuery):
+    rows = [
+        ("⭐ 50 Stars", "order:50 Stars"),
+        ("⭐ 100 Stars", "order:100 Stars"),
+        ("⭐ 250 Stars", "order:250 Stars"),
+        ("⭐ 500 Stars", "order:500 Stars"),
+        ("⬅️ Назад", "home"),
+    ]
+
+    await callback.message.edit_text(
+        "⭐ <b>Покупка Telegram Stars</b>\n\n"
+        "Выбери количество.\n"
+        "Это предварительный каталог: цена и наличие "
+        "подтверждаются администратором.",
+        reply_markup=keyboard(rows)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "premium")
+async def premium(callback: CallbackQuery):
+    rows = [
+        ("🌟 Premium на 1 месяц", "order:Premium на 1 месяц"),
+        ("🌟 Premium на 3 месяца", "order:Premium на 3 месяца"),
+        ("🌟 Premium на 6 месяцев", "order:Premium на 6 месяцев"),
+        ("🌟 Premium на 12 месяцев", "order:Premium на 12 месяцев"),
+        ("⬅️ Назад", "home"),
+    ]
+
+    await callback.message.edit_text(
+        "🌟 <b>Telegram Premium</b>\n\n"
+        "Выбери срок подписки, чтобы отправить заявку.",
+        reply_markup=keyboard(rows)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "gifts")
+async def gifts(callback: CallbackQuery):
+    rows = [
+        ("🎁 Каталог подарков", "order:Каталог подарков"),
+        ("🐻 Мишка", "order:Мишка"),
+        ("🌹 Роза", "order:Роза"),
+        ("🎂 Торт", "order:Торт"),
+        ("⬅️ Назад", "home"),
+    ]
+
+    await callback.message.edit_text(
+        "🎁 <b>Подарки Telegram</b>\n\n"
+        "Выбери позицию, чтобы уточнить доступность "
+        "и отправить заявку.",
+        reply_markup=keyboard(rows)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "free")
+async def free(callback: CallbackQuery):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute(
+            "UPDATE users SET balance=balance+10 WHERE user_id=?",
+            (callback.from_user.id,)
+        )
+        balance = db.execute(
+            "SELECT balance FROM users WHERE user_id=?",
+            (callback.from_user.id,)
+        ).fetchone()[0]
+
+    await callback.message.edit_text(
+        "🧸 <b>Бесплатный бонус!</b>\n\n"
+        "Ты получил 10 виртуальных монет.\n"
+        f"Твой баланс: {balance}\n\n"
+        "Монеты предназначены только для игры.",
+        reply_markup=back_menu()
+    )
+    await callback.answer("Бонус получен!")
+
+
+@dp.callback_query(F.data == "games")
+async def games(callback: CallbackQuery):
+    rows = [
+        ("🎲 Бросить кубик", "roll"),
+        ("⬅️ Назад", "home"),
+    ]
+
+    await callback.message.edit_text(
+        "🎮 <b>Мини-игры</b>\n\n"
+        "Играй ради развлечения. Ставок и денежных призов нет.",
+        reply_markup=keyboard(rows)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "roll")
+async def roll(callback: CallbackQuery):
+    number = random.randint(1, 6)
+
+    await callback.message.edit_text(
+        f"🎲 Выпало число: <b>{number}</b>\n\n"
+        "Это демонстрационная игра.",
+        reply_markup=back_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "giveaways")
+async def giveaways(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎟 <b>Розыгрыши</b>\n\n"
+        "Сейчас активных розыгрышей нет.",
+        reply_markup=back_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    with sqlite3.connect(DB_NAME) as db:
+        row = db.execute(
+            "SELECT balance FROM users WHERE user_id=?",
+            (callback.from_user.id,)
+        ).fetchone()
+
+        orders = db.execute(
+            "SELECT COUNT(*) FROM orders WHERE user_id=?",
+            (callback.from_user.id,)
+        ).fetchone()[0]
+
+    balance = row[0] if row else 0
+
+    await callback.message.edit_text(
+        "👤 <b>Твой профиль</b>\n\n"
+        f"ID: <code>{callback.from_user.id}</code>\n"
+        f"Виртуальный баланс: {balance}\n"
+        f"Количество заявок: {orders}",
+        reply_markup=back_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("order:"))
+async def create_order(callback: CallbackQuery):
+    item = callback.data.split(":", 1)[1]
+
+    with sqlite3.connect(DB_NAME) as db:
+        cursor = db.execute(
+            """INSERT INTO orders
+               (user_id, item, created_at)
+               VALUES (?, ?, ?)""",
+            (
+                callback.from_user.id,
+                item,
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        order_id = cursor.lastrowid
+
+    await callback.message.edit_text(
+        f"✅ <b>Заявка №{order_id} создана!</b>\n\n"
+        f"Товар: {item}\n\n"
+        "Администратор уточнит стоимость и наличие.",
+        reply_markup=back_menu()
+    )
+
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🛒 Новая заявка №{order_id}\n"
+                f"Пользователь: {callback.from_user.full_name}\n"
+                f"ID: {callback.from_user.id}\n"
+                f"Товар: {item}"
+            )
+        except Exception:
+            pass
+
+    await callback.answer("Заявка оформлена!")
+
+
+@dp.message(Command("id"))
+async def get_id(message: Message):
+    await message.answer(
+        f"Твой Telegram ID: <code>{message.from_user.id}</code>"
+    )
+
+
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        await message.answer("Команда доступна только администратору.")
+        return
+
+    with sqlite3.connect(DB_NAME) as db:
+        rows = db.execute(
+            """SELECT id, user_id, item, status
+               FROM orders ORDER BY id DESC LIMIT 10"""
+        ).fetchall()
+
+    if not rows:
+        await message.answer("Заявок пока нет.")
+        return
+
+    result = ["🛠 <b>Последние заявки</b>"]
+
+    for order_id, user_id, item, status in rows:
+        result.append(
+            f"№{order_id} | ID {user_id} | {item} | {status}"
+        )
+
+    await message.answer("\n".join(result))
+
+
+async def main():
+    init_db()
+    print("Бот запущен.")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
